@@ -78,12 +78,20 @@ class SpotubeAudioLosslessContainerQuality
   }
 }
 
+Duration _durationFromSeconds(num? s) => Duration(seconds: s?.toInt() ?? 0);
+
+int _durationToSeconds(Duration d) => d.inSeconds;
+
 @freezed
 class SpotubeAudioSourceMatchObject with _$SpotubeAudioSourceMatchObject {
   factory SpotubeAudioSourceMatchObject({
     required String id,
     required String title,
     required List<String> artists,
+    @JsonKey(
+      fromJson: _durationFromSeconds,
+      toJson: _durationToSeconds,
+    )
     required Duration duration,
     String? thumbnail,
     required String externalUri,

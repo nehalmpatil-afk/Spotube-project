@@ -15,7 +15,19 @@ import 'package:spotube/services/logger/logger.dart';
 import 'package:spotube/services/metadata/errors/exceptions.dart';
 
 import 'package:spotube/services/sourced_track/exceptions.dart';
-import 'package:spotube/utils/service_utils.dart';
+import 'package:flutter/foundation.dart';
+import 'package:spotube/utils/string_utils.dart';
+import 'package:spotube/utils/fuzzy_matcher.dart';
+import 'package:spotube/utils/artist_comparator.dart';
+import 'package:spotube/utils/duration_utils.dart';
+
+void _logTrackMatching(String message) {
+  try {
+    AppLogger.log.i(message);
+  } catch (_) {
+    debugPrint(message);
+  }
+}
 
 final officialMusicRegex = RegExp(
   r"official\s(video|audio|music\svideo|lyric\svideo|visualizer)",
@@ -106,49 +118,96 @@ class SourcedTrack extends BasicSourcedTrack {
     List<SpotubeAudioSourceMatchObject> results,
     SpotubeFullTrackObject track,
   ) {
-    return results
-        .map((sibling) {
-          int score = 0;
+    // Scoring weights
+    const int TITLE_EXACT_BONUS = 1000;
+    const int TITLE_SIMILARITY_WEIGHT = 1;
+    const int ARTIST_MATCH_BONUS = 200;
+    const int DURATION_BONUS = 50;
+    const int OFFICIAL_BONUS = 10;
 
-          for (final artist in track.artists) {
-            final isSameChannelArtist =
-                sibling.artists.any((a) => a.toLowerCase() == artist.name);
+    final normalizedQueryTitle = StringUtils.normalize(track.name);
+    final queryArtists = track.artists.map((a) => a.name).toList();
+    final queryDuration = Duration(milliseconds: track.durationMs);
 
-            if (isSameChannelArtist) {
-              score += 1;
-            }
+    _logTrackMatching(
+      "[TrackMatching] rankResults() called:\n"
+      "  Target Track: '${track.name}'\n"
+      "  Target Artists: [${queryArtists.join(', ')}]\n"
+      "  Target Duration: $queryDuration\n"
+      "  Evaluating ${results.length} candidate(s)...",
+    );
 
-            final titleContainsArtist =
-                sibling.title.toLowerCase().contains(artist.name.toLowerCase());
+    final scored = results.map((sibling) {
+      int score = 0;
+      final normalizedSiblingTitle = StringUtils.normalize(sibling.title);
 
-            if (titleContainsArtist) {
-              score += 1;
-            }
-          }
+      int exactTitleBonus = 0;
+      int fuzzySimilarityScore = 0;
+      int artistMatchBonus = 0;
+      int durationBonus = 0;
+      int officialBonus = 0;
 
-          final titleContainsTrackName =
-              sibling.title.toLowerCase().contains(track.name.toLowerCase());
+      // Exact title match bonus
+      if (normalizedQueryTitle == normalizedSiblingTitle) {
+        exactTitleBonus = TITLE_EXACT_BONUS;
+        score += exactTitleBonus;
+      } else {
+        // Fuzzy similarity (0‑100) multiplied by weight
+        fuzzySimilarityScore = TITLE_SIMILARITY_WEIGHT *
+            FuzzyMatcher.score(normalizedQueryTitle, normalizedSiblingTitle);
+        score += fuzzySimilarityScore;
+      }
 
-          final hasOfficialFlag =
-              officialMusicRegex.hasMatch(sibling.title.toLowerCase());
+      // Artist name match
+      for (final artistName in queryArtists) {
+        if (sibling.artists
+            .any((a) => ArtistComparator.sameName(a, artistName))) {
+          artistMatchBonus = ARTIST_MATCH_BONUS;
+          score += artistMatchBonus;
+          break;
+        }
+      }
 
-          if (titleContainsTrackName) {
-            score += 3;
-          }
+      // Duration closeness (default 5 s tolerance)
+      if (DurationUtils.isClose(sibling.duration, queryDuration)) {
+        durationBonus = DURATION_BONUS;
+        score += durationBonus;
+      }
 
-          if (hasOfficialFlag) {
-            score += 1;
-          }
+      // Official flag bonus
+      if (officialMusicRegex.hasMatch(sibling.title.toLowerCase())) {
+        officialBonus = OFFICIAL_BONUS;
+        score += officialBonus;
+      }
 
-          if (hasOfficialFlag && titleContainsTrackName) {
-            score += 2;
-          }
+      _logTrackMatching(
+        "[TrackMatching] Candidate Scored: '${sibling.title}'\n"
+        "  - Artists: [${sibling.artists.join(', ')}]\n"
+        "  - Duration: ${sibling.duration} (Target: $queryDuration)\n"
+        "  - Exact Title Bonus: +$exactTitleBonus\n"
+        "  - Fuzzy Title Similarity: +$fuzzySimilarityScore\n"
+        "  - Artist Match Bonus: +$artistMatchBonus\n"
+        "  - Duration Bonus: +$durationBonus\n"
+        "  - Official Bonus: +$officialBonus\n"
+        "  - Total Score: $score",
+      );
 
-          return (sibling: sibling, score: score);
-        })
-        .sorted((a, b) => b.score.compareTo(a.score))
-        .map((e) => e.sibling)
-        .toList();
+      return (sibling: sibling, score: score);
+    }).toList();
+
+    final sorted = scored.sorted((a, b) => b.score.compareTo(a.score));
+
+    _logTrackMatching(
+      "[TrackMatching] Final Sorted Order:\n${sorted.asMap().entries.map((e) => "  [${e.key}] Score: ${e.value.score} | '${e.value.sibling.title}' by [${e.value.sibling.artists.join(', ')}]").join('\n')}",
+    );
+
+    if (sorted.isNotEmpty) {
+      _logTrackMatching(
+        "[TrackMatching] Selected Best Match (Index 0): '${sorted.first.sibling.title}' (Total Score: ${sorted.first.score})",
+      );
+    }
+
+    return sorted.map((e) => e.sibling).toList();
   }
 
   static Future<List<SpotubeAudioSourceMatchObject>> fetchSiblings({
@@ -165,11 +224,19 @@ class SourcedTrack extends BasicSourcedTrack {
 
     final searchResults = await audioSource.audioSource.matches(query);
 
-    if (ServiceUtils.onlyContainsEnglish(query.name)) {
-      videoResults.addAll(searchResults);
-    } else {
-      videoResults.addAll(rankResults(searchResults, query));
-    }
+    _logTrackMatching(
+      "[TrackMatching] Search Results Returned:\n"
+      "  Requested Title: '${query.name}'\n"
+      "  Requested Artist(s): [${query.artists.map((a) => a.name).join(', ')}]\n"
+      "  Requested Duration: ${Duration(milliseconds: query.durationMs)}\n"
+      "  Candidates Count: ${searchResults.length}\n"
+      "  Candidates:\n${searchResults.asMap().entries.map((e) => "    [${e.key}] '${e.value.title}' by [${e.value.artists.join(', ')}] (${e.value.duration})").join('\n')}",
+    );
+
+    _logTrackMatching(
+      "[TrackMatching] Applying rankResults() for query: '${query.name}'",
+    );
+    videoResults.addAll(rankResults(searchResults, query));
 
     return videoResults.toSet().toList();
   }
