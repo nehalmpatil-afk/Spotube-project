@@ -87,3 +87,11 @@ tm.json
 
 android/build
 android/app/.cxx
+
+# Debug logs and local temporary files
+run_log.txt
+startup_log.txt
+log2.txt
+untranslated_messages.json
+flutter_01.png
+
