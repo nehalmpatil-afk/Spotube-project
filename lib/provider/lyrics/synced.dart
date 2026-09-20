@@ -1,7 +1,9 @@
 import 'dart:async';
 
+import 'package:collection/collection.dart';
 import 'package:dio/dio.dart';
 import 'package:drift/drift.dart';
+import 'package:fuzzywuzzy/fuzzywuzzy.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lrc/lrc.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -12,76 +14,250 @@ import 'package:spotube/provider/database/database.dart';
 import 'package:spotube/services/dio/dio.dart';
 import 'package:spotube/services/logger/logger.dart';
 
+String _normalizeString(String str) {
+  var s = str.toLowerCase();
+  s = s.replaceAll(
+      RegExp(r'\s*[\(\[](feat|ft)\.?\s+[^\]\)]*[\)\]]', caseSensitive: false),
+      '');
+  s = s.replaceAll(
+      RegExp(r'\s+feat\.?\s+.*|\s+ft\.?\s+.*', caseSensitive: false), '');
+  s = s.replaceAll(
+      RegExp(
+          r'\s*[\(\[\-]\s*(remastered|remaster|live|deluxe|bonus track|official video|audio|lyrics|version|edition|mix)[\)\]]?',
+          caseSensitive: false),
+      '');
+  s = s.replaceAll(RegExp(r'[^\w\s]'), '');
+  return s.replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
 class SyncedLyricsNotifier
     extends FamilyAsyncNotifier<SubtitleSimple, SpotubeTrackObject?> {
   SpotubeTrackObject get _track => arg!;
+
+  Future<SubtitleSimple?> _searchLRCLibFallback(String userAgent) async {
+    try {
+      final cleanTrack = _normalizeString(_track.name);
+      final cleanArtist =
+          _normalizeString(_track.artists.firstOrNull?.name ?? "");
+      final searchQuery = "$cleanTrack $cleanArtist".trim();
+
+      if (searchQuery.isEmpty) return null;
+
+      final searchRes = await globalDio.getUri(
+        Uri(
+          scheme: "https",
+          host: "lrclib.net",
+          path: "/api/search",
+          queryParameters: {
+            "q": searchQuery,
+          },
+        ),
+        options: Options(
+          headers: {"User-Agent": userAgent},
+          responseType: ResponseType.json,
+        ),
+      );
+
+      if (searchRes.statusCode != 200 || searchRes.data is! List) {
+        return null;
+      }
+
+      final items = searchRes.data as List;
+      if (items.isEmpty) return null;
+
+      final targetTrackNorm = _normalizeString(_track.name);
+      final targetArtistNorm =
+          _normalizeString(_track.artists.firstOrNull?.name ?? "");
+      final targetDurationSec =
+          _track.durationMs > 0 ? _track.durationMs / 1000.0 : 0.0;
+
+      ({Map<String, dynamic> item, double score})? bestMatch;
+
+      for (final rawItem in items) {
+        if (rawItem is! Map) continue;
+        final item = rawItem.cast<String, dynamic>();
+
+        final syncedLyricsRaw = item["syncedLyrics"] as String?;
+        final plainLyricsRaw = item["plainLyrics"] as String?;
+
+        final hasSynced = syncedLyricsRaw?.isNotEmpty == true;
+        final hasPlain = plainLyricsRaw?.isNotEmpty == true;
+
+        if (!hasSynced && !hasPlain) continue;
+
+        final candidateTrack = item["trackName"] as String? ?? "";
+        final candidateArtist = item["artistName"] as String? ?? "";
+        final candidateDuration =
+            (item["duration"] as num?)?.toDouble() ?? 0.0;
+
+        final candidateTrackNorm = _normalizeString(candidateTrack);
+        final candidateArtistNorm = _normalizeString(candidateArtist);
+
+        final trackSim =
+            ratio(targetTrackNorm, candidateTrackNorm).toDouble();
+        final artistSim =
+            targetArtistNorm.isNotEmpty && candidateArtistNorm.isNotEmpty
+                ? ratio(targetArtistNorm, candidateArtistNorm).toDouble()
+                : 100.0;
+
+        double textScore = (trackSim * 0.65) + (artistSim * 0.35);
+
+        if (trackSim < 45 && textScore < 50) continue;
+
+        double durationScoreBonus = 0.0;
+        if (targetDurationSec > 0 && candidateDuration > 0) {
+          final durDiff = (targetDurationSec - candidateDuration).abs();
+          if (durDiff <= 2.0) {
+            durationScoreBonus = 20.0;
+          } else if (durDiff <= 5.0) {
+            durationScoreBonus = 12.0;
+          } else if (durDiff <= 10.0) {
+            durationScoreBonus = 5.0;
+          } else if (durDiff > 30.0) {
+            durationScoreBonus = -30.0;
+          }
+        }
+
+        double syncedBonus = hasSynced ? 25.0 : 0.0;
+        double totalScore = textScore + durationScoreBonus + syncedBonus;
+
+        if (bestMatch == null || totalScore > bestMatch.score) {
+          bestMatch = (item: item, score: totalScore);
+        }
+      }
+
+      if (bestMatch == null) return null;
+
+      final matchedItem = bestMatch.item;
+      final syncedLyricsRaw = matchedItem["syncedLyrics"] as String?;
+      final plainLyricsRaw = matchedItem["plainLyrics"] as String?;
+
+      if (syncedLyricsRaw?.isNotEmpty == true) {
+        final syncedLyrics = Lrc.parse(syncedLyricsRaw!)
+            .lyrics
+            .map(LyricSlice.fromLrcLine)
+            .toList();
+
+        if (syncedLyrics.isNotEmpty) {
+          return SubtitleSimple(
+            lyrics: syncedLyrics,
+            name: _track.name,
+            uri: searchRes.realUri,
+            rating: 90,
+            provider: "LRCLib",
+          );
+        }
+      }
+
+      if (plainLyricsRaw?.isNotEmpty == true) {
+        final plainLyrics = plainLyricsRaw!
+            .split("\n")
+            .map((line) => LyricSlice(text: line, time: Duration.zero))
+            .toList();
+
+        return SubtitleSimple(
+          lyrics: plainLyrics,
+          name: _track.name,
+          uri: searchRes.realUri,
+          rating: 0,
+          provider: "LRCLib",
+        );
+      }
+    } catch (e, stack) {
+      AppLogger.reportError(e, stack);
+    }
+
+    return null;
+  }
 
   /// Lyrics credits: [lrclib.net](https://lrclib.net) and their contributors
   /// Thanks for their generous public API
   Future<SubtitleSimple> getLRCLibLyrics() async {
     final packageInfo = await PackageInfo.fromPlatform();
+    final userAgent =
+        "Spotube v${packageInfo.version} (https://github.com/KRTirtho/spotube)";
 
-    final res = await globalDio.getUri(
-      Uri(
-        scheme: "https",
-        host: "lrclib.net",
-        path: "/api/get",
-        queryParameters: {
-          "artist_name": _track.artists.first.name,
-          "track_name": _track.name,
-          "album_name": _track.album.name,
-          if (_track.durationMs > 0)
-            "duration": (_track.durationMs / 1000).toInt().toString(),
-        },
-      ),
-      options: Options(
-        headers: {
-          "User-Agent":
-              "Spotube v${packageInfo.version} (https://github.com/KRTirtho/spotube)"
-        },
-        responseType: ResponseType.json,
-      ),
-    );
+    SubtitleSimple? exactResult;
 
-    if (res.statusCode != 200) {
-      return SubtitleSimple(
-        lyrics: [],
-        name: _track.name,
-        uri: res.realUri,
-        rating: 0,
-        provider: "LRCLib",
+    try {
+      final res = await globalDio.getUri(
+        Uri(
+          scheme: "https",
+          host: "lrclib.net",
+          path: "/api/get",
+          queryParameters: {
+            "artist_name": _track.artists.first.name,
+            "track_name": _track.name,
+            "album_name": _track.album.name,
+            if (_track.durationMs > 0)
+              "duration": (_track.durationMs / 1000).toInt().toString(),
+          },
+        ),
+        options: Options(
+          headers: {"User-Agent": userAgent},
+          responseType: ResponseType.json,
+        ),
       );
+
+      if (res.statusCode == 200 && res.data is Map<String, dynamic>) {
+        final json = res.data as Map<String, dynamic>;
+
+        final syncedLyricsRaw = json["syncedLyrics"] as String?;
+        final syncedLyrics = syncedLyricsRaw?.isNotEmpty == true
+            ? Lrc.parse(syncedLyricsRaw!)
+                .lyrics
+                .map(LyricSlice.fromLrcLine)
+                .toList()
+            : null;
+
+        if (syncedLyrics?.isNotEmpty == true) {
+          return SubtitleSimple(
+            lyrics: syncedLyrics!,
+            name: _track.name,
+            uri: res.realUri,
+            rating: 100,
+            provider: "LRCLib",
+          );
+        }
+
+        final plainLyricsRaw = json["plainLyrics"] as String?;
+        if (plainLyricsRaw?.isNotEmpty == true) {
+          final plainLyrics = plainLyricsRaw!
+              .split("\n")
+              .map((line) => LyricSlice(text: line, time: Duration.zero))
+              .toList();
+
+          exactResult = SubtitleSimple(
+            lyrics: plainLyrics,
+            name: _track.name,
+            uri: res.realUri,
+            rating: 0,
+            provider: "LRCLib",
+          );
+        }
+      }
+    } catch (_) {
+      // Exact match lookup failed or returned error status; proceed to fallback search
     }
 
-    final json = res.data as Map<String, dynamic>;
+    final fallbackResult = await _searchLRCLibFallback(userAgent);
 
-    final syncedLyricsRaw = json["syncedLyrics"] as String?;
-    final syncedLyrics = syncedLyricsRaw?.isNotEmpty == true
-        ? Lrc.parse(syncedLyricsRaw!)
-            .lyrics
-            .map(LyricSlice.fromLrcLine)
-            .toList()
-        : null;
-
-    if (syncedLyrics?.isNotEmpty == true) {
-      return SubtitleSimple(
-        lyrics: syncedLyrics!,
-        name: _track.name,
-        uri: res.realUri,
-        rating: 100,
-        provider: "LRCLib",
-      );
+    if (fallbackResult != null && fallbackResult.lyrics.isNotEmpty) {
+      if (fallbackResult.rating > 0 ||
+          exactResult == null ||
+          exactResult.lyrics.isEmpty) {
+        return fallbackResult;
+      }
     }
 
-    final plainLyrics = (json["plainLyrics"] as String)
-        .split("\n")
-        .map((line) => LyricSlice(text: line, time: Duration.zero))
-        .toList();
+    if (exactResult != null) {
+      return exactResult;
+    }
 
     return SubtitleSimple(
-      lyrics: plainLyrics,
+      lyrics: [],
       name: _track.name,
-      uri: res.realUri,
+      uri: Uri.parse("https://lrclib.net"),
       rating: 0,
       provider: "LRCLib",
     );
